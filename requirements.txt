@@ -1,0 +1,9 @@
+streamlit>=1.49.0
+pandas>=2.3.1
+numpy>=2.3.1
+shapely>=2.1.1
+ezdxf>=1.4.3
+matplotlib>=3.10.5
+openpyxl>=3.1.5
+pyproj>=3.6.0
+geopy>=2.4.0
