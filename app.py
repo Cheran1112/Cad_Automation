@@ -61,6 +61,27 @@ from utils.logger import configure_logging, get_logger
 from validation.validator import ValidationResult, validate
 
 # ---------------------------------------------------------------------------
+# Solar Layout Planning module (optional – independent extension)
+# ---------------------------------------------------------------------------
+try:
+    from solar_layout import (
+        SOLAR_MODULE_ENABLED,
+        SpacingRules,
+        SolarLayoutResult,
+        SolarReport,
+        apply_solar_overlay,
+        build_solar_report,
+        run_solar_layout,
+        save_solar_dxf,
+        solar_dxf_to_bytes,
+        solar_report_to_json,
+    )
+    _SOLAR_AVAILABLE = True
+except ImportError:
+    _SOLAR_AVAILABLE = False
+    SOLAR_MODULE_ENABLED = False
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 configure_logging(level=logging.INFO)
@@ -95,6 +116,10 @@ _KEY_COORD_FORMAT    = "coord_format"
 _KEY_IMPORT_FORMAT   = "import_coord_format"   # 'easting_northing' | 'latitude_longitude'
 _KEY_IMPORT_SRC_CRS  = "import_source_crs"     # 'native' | 'EPSG:4326'
 _KEY_IMPORT_TGT_EPSG = "import_target_epsg"    # '' | 'EPSG:32644' etc.
+# Solar Layout module
+_KEY_SOLAR_RESULT    = "solar_layout_result"   # SolarLayoutResult | None
+_KEY_SOLAR_DXF_BYTES = "solar_dxf_bytes"       # bytes | None
+_KEY_SOLAR_DXF_NAME  = "solar_dxf_filename"    # str | None
 
 
 def _init_state() -> None:
@@ -113,6 +138,9 @@ def _init_state() -> None:
         _KEY_IMPORT_FORMAT,
         _KEY_IMPORT_SRC_CRS,
         _KEY_IMPORT_TGT_EPSG,
+        _KEY_SOLAR_RESULT,
+        _KEY_SOLAR_DXF_BYTES,
+        _KEY_SOLAR_DXF_NAME,
     ):
         if key not in st.session_state:
             st.session_state[key] = None
@@ -175,7 +203,7 @@ def _render_upload_section() -> None:
 
     # Only re-process when the uploaded file actually changes
     if st.session_state[_KEY_UPLOADED_NAME] != uploaded.name:
-        # Reset ALL downstream state including location
+        # Reset ALL downstream state including location and solar
         for key in (
             _KEY_DF,
             _KEY_VALIDATION,
@@ -186,6 +214,9 @@ def _render_upload_section() -> None:
             _KEY_LOCATION_RESULT,
             _KEY_SELECTED_CRS,
             _KEY_COORD_FORMAT,
+            _KEY_SOLAR_RESULT,
+            _KEY_SOLAR_DXF_BYTES,
+            _KEY_SOLAR_DXF_NAME,
         ):
             st.session_state[key] = None
 
@@ -622,6 +653,221 @@ def _render_location_section() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Solar Layout Planning - Section 7 (independent extension)
+# ---------------------------------------------------------------------------
+
+def _render_solar_section() -> None:
+    """Section 7 - Solar Layout Planning. Purely additive, no existing code changed."""
+    if not _SOLAR_AVAILABLE or not SOLAR_MODULE_ENABLED:
+        return
+
+    polyline = st.session_state[_KEY_POLYLINE]
+    metrics  = st.session_state[_KEY_METRICS]
+    if polyline is None or metrics is None:
+        return
+
+    st.header("7 - Solar Layout Planning")
+    st.caption(
+        "Compute the maximum number of solar panels that fit inside the "
+        "land boundary and produce an updated CAD overlay."
+    )
+
+    # -- Configuration -------------------------------------------------------
+    with st.expander("Layout configuration", expanded=False):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            orientation = st.selectbox(
+                "Panel orientation",
+                options=["auto", "portrait", "landscape"],
+                index=0,
+                key="solar_orientation",
+                help="auto tries both orientations and picks the one with more panels.",
+            )
+            setback = st.number_input(
+                "Boundary setback (m)",
+                min_value=0.0, max_value=50.0, value=3.0, step=0.5,
+                key="solar_setback",
+                help="Inward setback from the land boundary.",
+            )
+            row_spacing = st.number_input(
+                "Row spacing (m)",
+                min_value=2.5, max_value=20.0, value=3.5, step=0.1,
+                key="solar_row_spacing",
+                help="North-south row pitch, must exceed panel height.",
+            )
+        with col_b:
+            panel_gap = st.number_input(
+                "Inter-panel gap (m)",
+                min_value=0.0, max_value=1.0, value=0.02, step=0.01,
+                key="solar_panel_gap",
+                help="Structural tolerance gap between panels in the same row.",
+            )
+            corridor = st.number_input(
+                "Utility corridor width (m)",
+                min_value=0.0, max_value=20.0, value=0.0, step=0.5,
+                key="solar_corridor",
+                help="Width reserved on the south edge for roads or cables. 0 = off.",
+            )
+            st.number_input(
+                "Peak sun hours / day",
+                min_value=1.0, max_value=12.0, value=5.5, step=0.1,
+                key="solar_peak_sun",
+                help="Site-specific value used for annual yield estimate.",
+            )
+
+    # -- Action buttons ------------------------------------------------------
+    btn_col, rst_col = st.columns([3, 1])
+    run_clicked = btn_col.button("Run Solar Layout", type="primary", key="btn_solar_run")
+    if rst_col.button("Reset", key="btn_solar_reset"):
+        for k in (_KEY_SOLAR_RESULT, _KEY_SOLAR_DXF_BYTES, _KEY_SOLAR_DXF_NAME):
+            st.session_state[k] = None
+        st.rerun()
+
+    if run_clicked:
+        for k in (_KEY_SOLAR_RESULT, _KEY_SOLAR_DXF_BYTES, _KEY_SOLAR_DXF_NAME):
+            st.session_state[k] = None
+
+    # -- Execute pipeline ----------------------------------------------------
+    if st.session_state[_KEY_SOLAR_RESULT] is None and run_clicked:
+        with st.spinner("Running solar layout engine..."):
+            try:
+                orient_for_rules = (
+                    orientation if orientation in ("portrait", "landscape")
+                    else "portrait"
+                )
+                rules = SpacingRules(
+                    boundary_setback_m=float(st.session_state["solar_setback"]),
+                    inter_panel_gap_m=float(st.session_state["solar_panel_gap"]),
+                    inter_row_spacing_m=float(st.session_state["solar_row_spacing"]),
+                    utility_corridor_width_m=float(st.session_state["solar_corridor"]),
+                    orientation=orient_for_rules,
+                )
+                solar_result = run_solar_layout(
+                    coords=polyline.coordinates,
+                    rules=rules,
+                    orientation=orientation,
+                )
+                st.session_state[_KEY_SOLAR_RESULT] = solar_result
+
+                if solar_result.panel_count > 0:
+                    overlay_doc = generate_dxf(polyline, metrics)
+                    apply_solar_overlay(overlay_doc, solar_result)
+                    s_bytes = solar_dxf_to_bytes(overlay_doc)
+                    stem = safe_stem(st.session_state[_KEY_UPLOADED_NAME] or "survey")
+                    existing = st.session_state[_KEY_DXF_FILENAME] or stem
+                    base_stem = existing.replace(".dxf", "")
+                    s_name = base_stem + "_solar_layout.dxf"
+                    save_solar_dxf(overlay_doc, base_stem=base_stem, output_dir=OUTPUT_DIR)
+                    st.session_state[_KEY_SOLAR_DXF_BYTES] = s_bytes
+                    st.session_state[_KEY_SOLAR_DXF_NAME]  = s_name
+
+                logger.info(
+                    "Solar layout: %d panels, %.2f kWp.",
+                    solar_result.panel_count,
+                    solar_result.installed_capacity_kwp,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Solar layout failed: {exc}")
+                logger.exception("Solar layout error.")
+                return
+
+    solar_result = st.session_state[_KEY_SOLAR_RESULT]
+    if solar_result is None:
+        st.info("Configure parameters above then click Run Solar Layout.")
+        return
+
+    for w in solar_result.warnings:
+        st.warning(w)
+    if solar_result.error:
+        st.error(solar_result.error)
+        return
+
+    # -- Hero metrics --------------------------------------------------------
+    from solar_layout.capacity_calculator import format_capacity, format_energy
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Solar Panels",       f"{solar_result.panel_count:,}")
+    m2.metric("Installed Capacity",  format_capacity(solar_result.installed_capacity_kwp))
+    m3.metric("Layout Efficiency",   f"{solar_result.layout_efficiency_pct:.1f} %")
+    m4.metric("Orientation",         solar_result.orientation_used.capitalize())
+
+    st.divider()
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("Total Land Area",  f"{solar_result.total_area_m2:,.1f} m2")
+    m6.metric("Usable Area",      f"{solar_result.usable_area_m2:,.1f} m2")
+    m7.metric("Panel Area",       f"{solar_result.total_panel_area_m2:,.1f} m2")
+    m8.metric("Remaining Area",   f"{solar_result.remaining_area_m2:,.1f} m2")
+
+    if solar_result.capacity:
+        st.divider()
+        e1, e2, e3 = st.columns(3)
+        cap = solar_result.capacity
+        e1.metric("Daily Yield",  format_energy(cap.estimated_daily_yield_kwh) + "/day")
+        e2.metric("Annual Yield", format_energy(cap.estimated_annual_yield_kwh) + "/yr")
+        e3.metric("GCR",          f"{solar_result.ground_coverage_ratio:.4f}")
+
+    # -- Detailed report sections --------------------------------------------
+    st.divider()
+    report = build_solar_report(solar_result)
+    for section in report.sections:
+        with st.expander(section.title, expanded=False):
+            tbl = [{"Field": r.label, "Value": r.display_value()} for r in section.rows]
+            st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
+
+    # -- Downloads -----------------------------------------------------------
+    st.divider()
+    d1, d2 = st.columns(2)
+    s_bytes = st.session_state[_KEY_SOLAR_DXF_BYTES]
+    s_name  = st.session_state[_KEY_SOLAR_DXF_NAME]
+
+    with d1:
+        if s_bytes and s_name:
+            st.download_button(
+                label="Download Solar DXF",
+                data=s_bytes,
+                file_name=s_name,
+                mime="application/dxf",
+                key="btn_dl_solar_dxf",
+                type="primary",
+                use_container_width=True,
+            )
+        else:
+            st.info("Solar DXF not available (no panels placed).")
+
+    with d2:
+        json_str  = solar_report_to_json(solar_result)
+        json_name = (s_name or "solar_layout").replace(".dxf", "") + "_report.json"
+        st.download_button(
+            label="Download JSON Report",
+            data=json_str,
+            file_name=json_name,
+            mime="application/json",
+            key="btn_dl_solar_json",
+            type="secondary",
+            use_container_width=True,
+        )
+
+    with st.expander("Solar DXF layer information", expanded=False):
+        st.dataframe(
+            pd.DataFrame([
+                {"Layer": "SOLAR_PANELS",
+                 "Content": "Panel rectangles (LWPolyline per panel)",
+                 "Colour (ACI)": "4 - Cyan",
+                 "Line weight": "0.13 mm"},
+                {"Layer": "SOLAR_USABLE_BOUNDARY",
+                 "Content": "Usable area boundary after setback",
+                 "Colour (ACI)": "6 - Magenta",
+                 "Line weight": "0.18 mm"},
+                {"Layer": "SOLAR_LABELS",
+                 "Content": "Summary text block",
+                 "Colour (ACI)": "7 - White/Black",
+                 "Line weight": "default"},
+            ]),
+            use_container_width=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -646,6 +892,7 @@ def main() -> None:
     _render_geometry_preview()
     _render_dxf_section()
     _render_location_section()
+    _render_solar_section()
 
 
 if __name__ == "__main__":
